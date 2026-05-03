@@ -1,1 +1,10 @@
 build/
+*.pyc
+__pycache__/
+*.log
+*.tmp
+*.bak
+*.swp
+.DS_Store
+.idea/
+.vscode/

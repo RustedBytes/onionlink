@@ -44,11 +44,99 @@ cmake -S . -B build
 cmake --build build
 ```
 
-Or build the container image:
+Build Linux Python wheels with Docker:
 
 ```sh
-docker build -t onionlink .
+docker build --target wheels --output type=local,dest=dist .
 ```
+
+This writes Python 3.10+ manylinux wheels into `dist/`. The wheel build is
+Linux-only and uses `auditwheel` to bundle libsodium and mbedTLS into the wheel.
+
+Build a wheel directly on a Linux host with the native dependencies installed:
+
+```sh
+python -m pip wheel . -w dist
+```
+
+## Python Client
+
+The Python package exposes an OOP session API. A `Session` downloads the
+microdescriptor consensus and hydrates relay microdescriptors once, then reuses
+that directory state for multiple onion-service requests. Request methods release
+the Python GIL while doing network work, so one initialized session can be used
+from `asyncio.to_thread`, a `ThreadPoolExecutor`, or regular worker threads.
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+from onionlink import Session
+
+session = Session(timeout_ms=30_000, verbose=False)
+
+def fetch(onion: str) -> bytes:
+    return session.get(onion, port=80, path="/").body
+
+onions = [
+    "archiveiya74codqgiixo33q62qlrqtkgmcitqx5u2oeqnmn5bpcbiyd.onion",
+]
+
+with ThreadPoolExecutor(max_workers=4) as pool:
+    for body in pool.map(fetch, onions):
+        print(body[:200])
+```
+
+Raw request bytes are also supported:
+
+```python
+from onionlink import Session
+
+session = Session(bootstrap="128.31.0.39:9131", timeout_ms=30_000)
+response = session.raw_request(
+    "exampleexampleexampleexampleexampleexampleexampleexampleexampleexample.onion",
+    1234,
+    b"hello\n",
+)
+```
+
+Use `request()` for full HTTP control:
+
+```python
+from onionlink import Session
+
+session = Session(timeout_ms=30_000)
+response = session.request(
+    "POST",
+    "exampleexampleexampleexampleexampleexampleexampleexampleexampleexample.onion",
+    port=80,
+    path="/api/items",
+    params={"trace": "1"},
+    headers={"Accept": "application/json"},
+    json={"name": "test"},
+    response_limit=8 * 1024 * 1024,
+)
+
+response.raise_for_status()
+print(response.status_code, response.header("content-type"))
+print(response.text)
+```
+
+`Session` constructor arguments:
+
+- `bootstrap`: HTTP directory cache as `host:port`.
+- `consensus_file`: optional local `consensus-microdesc` file.
+- `timeout_ms`: TCP/TLS read timeout.
+- `verbose`: print native bootstrap and rendezvous progress to stderr.
+
+Request methods:
+
+- `request(method, onion, *, port=80, path="/", params=None, headers=None, body=None, data=None, json=None, form=None, host=None, http_version="HTTP/1.0", response_limit=4194304) -> Response`
+- `get/head/post/put/patch/delete/options(onion, **request_options) -> Response`
+- `raw_request(onion, port, payload=b"", response_limit=4194304) -> bytes`
+
+`Response` exposes `status_code`, `reason`, `headers`, `body`, `raw`,
+`http_version`, `ok`, `text`, `encoding`, `header(name)`, and
+`raise_for_status()`.
 
 ## Usage
 

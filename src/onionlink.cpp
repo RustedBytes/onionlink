@@ -2583,6 +2583,7 @@ RendezvousStream connect_onion_service_with_retries(
 
 } // namespace
 
+#ifndef ONIONLINK_NO_MAIN
 int main(int argc, char **argv) {
   try {
     require(sodium_init() >= 0, "libsodium initialization failed");
@@ -2638,3 +2639,4 @@ int main(int argc, char **argv) {
     return 1;
   }
 }
+#endif
