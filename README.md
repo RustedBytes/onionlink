@@ -44,16 +44,23 @@ cmake -S . -B build
 cmake --build build
 ```
 
+Or build the container image:
+
+```sh
+docker build -t onionlink .
+```
+
 ## Usage
 
 ```sh
 ./build/onionlink <service-v3-address>.onion <port> [options]
 ```
 
-Fetch `/` over HTTP:
+Fetch `/` over HTTP from the container:
 
 ```sh
-./build/onionlink archiveiya74codqgiixo33q62qlrqtkgmcitqx5u2oeqnmn5bpcbiyd.onion 80 \
+docker run --rm onionlink \
+  archiveiya74codqgiixo33q62qlrqtkgmcitqx5u2oeqnmn5bpcbiyd.onion 80 \
   --http-get / \
   --verbose
 ```
