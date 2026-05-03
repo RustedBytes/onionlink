@@ -112,7 +112,7 @@ PYBIND11_MODULE(_native, m, py::mod_gil_not_used()) {
       .def(py::init<const std::string &, const std::string &, int, bool>(),
            py::arg("bootstrap") = "128.31.0.39:9131",
            py::arg("consensus_file") = "", py::arg("timeout_ms") = 30000,
-           py::arg("verbose") = false)
+           py::arg("verbose") = false, py::call_guard<py::gil_scoped_release>())
       .def("request", &PythonSession::request, py::arg("onion"),
            py::arg("port"), py::arg("payload") = py::bytes(),
            py::arg("response_limit") = 4 * 1024 * 1024)

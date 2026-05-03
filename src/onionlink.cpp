@@ -11,6 +11,7 @@
 #include <mbedtls/ssl.h>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -650,6 +651,7 @@ OnionAddress parse_onion_address(const std::string &addr) {
 }
 
 int connect_tcp(const std::string &host, uint16_t port, int timeout_ms) {
+  require(timeout_ms >= 0, "timeout must be non-negative");
   addrinfo hints{};
   hints.ai_socktype = SOCK_STREAM;
   hints.ai_family = AF_UNSPEC;
@@ -659,20 +661,78 @@ int connect_tcp(const std::string &host, uint16_t port, int timeout_ms) {
   require(gai == 0, std::string("getaddrinfo failed for ") + host + ": " +
                         gai_strerror(gai));
   int fd = -1;
+  std::string last_error = "no address found";
   for (addrinfo *ai = res; ai; ai = ai->ai_next) {
     fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
     if (fd < 0) {
+      last_error = std::strerror(errno);
       continue;
     }
-    if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+      last_error = std::strerror(errno);
+      close(fd);
+      fd = -1;
+      continue;
+    }
+
+    int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+    if (rc != 0 && errno == EINPROGRESS) {
+      pollfd pfd{};
+      pfd.fd = fd;
+      pfd.events = POLLOUT;
+      do {
+        rc = poll(&pfd, 1, timeout_ms);
+      } while (rc < 0 && errno == EINTR);
+      if (rc == 0) {
+        last_error = "connect timeout";
+        close(fd);
+        fd = -1;
+        continue;
+      }
+      if (rc < 0) {
+        last_error = std::strerror(errno);
+        close(fd);
+        fd = -1;
+        continue;
+      }
+      int so_error = 0;
+      socklen_t so_error_len = sizeof(so_error);
+      if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &so_error_len) != 0) {
+        last_error = std::strerror(errno);
+        close(fd);
+        fd = -1;
+        continue;
+      }
+      if (so_error != 0) {
+        last_error = std::strerror(so_error);
+        close(fd);
+        fd = -1;
+        continue;
+      }
+    } else if (rc != 0) {
+      last_error = std::strerror(errno);
+      close(fd);
+      fd = -1;
+      continue;
+    }
+
+    if (fcntl(fd, F_SETFL, flags) < 0) {
+      last_error = std::strerror(errno);
+      close(fd);
+      fd = -1;
+      continue;
+    }
+
+    if (fd >= 0) {
       break;
     }
-    close(fd);
-    fd = -1;
   }
   freeaddrinfo(res);
   require(fd >= 0,
-          "tcp connect failed to " + host + ":" + std::to_string(port));
+          "tcp connect failed to " + host + ":" + std::to_string(port) +
+              ": " + last_error);
   timeval tv{};
   tv.tv_sec = timeout_ms / 1000;
   tv.tv_usec = (timeout_ms % 1000) * 1000;
@@ -752,17 +812,25 @@ Bytes decode_http_body(const Bytes &response) {
 Bytes http_get_direct(const HostPort &hp, const std::string &path,
                       int timeout_ms) {
   int fd = connect_tcp(hp.host, hp.port, timeout_ms);
-  std::ostringstream req;
-  req << "GET " << path << " HTTP/1.0\r\n"
-      << "Host: " << hp.host << "\r\n"
-      << "User-Agent: onionlink/0\r\n"
-      << "Accept-Encoding: identity\r\n"
-      << "Connection: close\r\n\r\n";
-  Bytes rb = from_string(req.str());
-  write_all_fd(fd, rb);
-  Bytes resp = read_all_fd(fd);
-  close(fd);
-  return decode_http_body(resp);
+  try {
+    std::ostringstream req;
+    req << "GET " << path << " HTTP/1.0\r\n"
+        << "Host: " << hp.host << "\r\n"
+        << "User-Agent: onionlink/0\r\n"
+        << "Accept-Encoding: identity\r\n"
+        << "Connection: close\r\n\r\n";
+    Bytes rb = from_string(req.str());
+    write_all_fd(fd, rb);
+    Bytes resp = read_all_fd(fd);
+    close(fd);
+    fd = -1;
+    return decode_http_body(resp);
+  } catch (...) {
+    if (fd >= 0) {
+      close(fd);
+    }
+    throw;
+  }
 }
 
 std::time_t parse_time_utc(const std::string &date, const std::string &time) {
@@ -1201,14 +1269,23 @@ class TorChannel {
 public:
   TorChannel(std::string host, uint16_t port, int timeout_ms)
       : host_(std::move(host)), port_(port), timeout_ms_(timeout_ms) {
-    init_tls();
-    negotiate();
+    try {
+      init_tls();
+      negotiate();
+    } catch (...) {
+      cleanup();
+      throw;
+    }
   }
 
   TorChannel(const TorChannel &) = delete;
   TorChannel &operator=(const TorChannel &) = delete;
 
   ~TorChannel() {
+    cleanup();
+  }
+
+  void cleanup() noexcept {
     mbedtls_ssl_close_notify(&ssl_);
     mbedtls_net_free(&net_);
     mbedtls_ssl_free(&ssl_);
@@ -1264,10 +1341,8 @@ private:
                                   reinterpret_cast<const unsigned char *>(pers),
                                   std::strlen(pers)) == 0,
             "ctr_drbg seed failed");
-    require(mbedtls_net_connect(&net_, host_.c_str(),
-                                std::to_string(port_).c_str(),
-                                MBEDTLS_NET_PROTO_TCP) == 0,
-            "TLS tcp connect failed to " + host_ + ":" + std::to_string(port_));
+    int fd = connect_tcp(host_, port_, timeout_ms_);
+    net_.fd = fd;
     require(mbedtls_ssl_config_defaults(&conf_, MBEDTLS_SSL_IS_CLIENT,
                                         MBEDTLS_SSL_TRANSPORT_STREAM,
                                         MBEDTLS_SSL_PRESET_DEFAULT) == 0,
